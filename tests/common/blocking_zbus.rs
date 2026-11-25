@@ -107,6 +107,10 @@ impl<'a> Proxy<'a> {
         block_on(self.0.get_property(property_name))
     }
 
+    pub fn introspect(&self) -> zbus::fdo::Result<String> {
+        block_on(self.0.introspect())
+    }
+
     pub fn receive_signal_with_args<'m, M>(
         &self,
         signal_name: M,

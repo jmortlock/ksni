@@ -9,13 +9,14 @@ use std::sync::Arc;
 use futures_util::{future::Either, StreamExt};
 use pastey::paste;
 use zbus::fdo::DBusProxy;
+use zbus::object_server::SignalEmitter;
 use zbus::Connection;
 use zbus::{OwnedVariant, Variant};
 
 use crate::compat::{mpsc, select, Mutex};
 use crate::dbus_interface::{
-    Context, DbusMenu, Layout, StatusNotifierItem, StatusNotifierWatcherProxy, MENU_INTERFACE,
-    MENU_PATH, SNI_INTERFACE, SNI_PATH,
+    Context, DbusMenu, Layout, MenuOnlyStatusNotifierItem, StatusNotifierItem,
+    StatusNotifierWatcherProxy, MENU_INTERFACE, MENU_PATH, SNI_INTERFACE, SNI_PATH,
 };
 use crate::menu;
 use crate::{Error, HandleRequest, OfflineReason, Tray};
@@ -28,17 +29,21 @@ pub(crate) async fn run<T: Tray>(
     own_name: bool,
     assume_sni_available: bool,
 ) -> Result<impl Future<Output = ()>, Error> {
-    let sni_obj = StatusNotifierItem::new(service.clone());
     let menu_obj = DbusMenu::new(service.clone());
-    let Service { state, .. } = service;
 
     // zbus 6 builders defer every error, an invalid path included, to `build()`
-    let conn = zbus::connection::Builder::session()
-        .serve_at(SNI_PATH, sni_obj)
+    let builder = zbus::connection::Builder::session();
+    let builder = if T::MENU_ON_ACTIVATE {
+        builder.serve_at(SNI_PATH, MenuOnlyStatusNotifierItem::new(service.clone()))
+    } else {
+        builder.serve_at(SNI_PATH, StatusNotifierItem::new(service.clone()))
+    };
+    let conn = builder
         .serve_at(MENU_PATH, menu_obj)
         .build()
         .await
         .map_err(|e| Error::Dbus(e))?;
+    let Service { state, .. } = service;
 
     let name = if own_name {
         let name = format!(
@@ -230,10 +235,7 @@ impl<T: Tray> Service<T> {
 
 impl<T: Tray> State<T> {
     async fn update_properties(&mut self, conn: &Connection) -> zbus::Result<()> {
-        let sni_obj = conn
-            .object_server()
-            .interface::<_, StatusNotifierItem<T>>(SNI_PATH)
-            .await?;
+        let sni_emitter = SignalEmitter::new(conn, SNI_PATH)?;
         let menu_obj = conn
             .object_server()
             .interface::<_, DbusMenu<T>>(MENU_PATH)
@@ -247,17 +249,19 @@ impl<T: Tray> State<T> {
         }
 
         if self.status_changed() {
-            StatusNotifierItem::<T>::new_status(
-                sni_obj.signal_emitter(),
-                &self.get_status().to_string(),
-            )
-            .await?;
+            StatusNotifierItem::<T>::new_status(&sni_emitter, &self.get_status().to_string())
+                .await?;
             menu_changed.insert("Status", self.get_status().to_menu_status().into());
         }
 
         if self.icon_theme_path_changed() {
-            sni_changed.insert("IconThemePath", self.get_icon_theme_path().into());
-            menu_changed.insert("IconThemePath", vec![self.get_icon_theme_path()].into());
+            let icon_theme_path = self.get_icon_theme_path();
+            // `NewIconThemePath` is a non-standard Ayatana extension to the KDE
+            // StatusNotifierItem spec. Emit it on a best-effort for hosts that
+            // support it. `PropertiesChanged` covers the rest.
+            StatusNotifierItem::<T>::new_icon_theme_path(&sni_emitter, &icon_theme_path).await?;
+            sni_changed.insert("IconThemePath", icon_theme_path.clone().into());
+            menu_changed.insert("IconThemePath", vec![icon_theme_path].into());
         }
 
         if self.category_changed() {
@@ -271,27 +275,68 @@ impl<T: Tray> State<T> {
         // TODO: assert the id is consistent
 
         if self.title_changed() {
-            StatusNotifierItem::<T>::new_title(sni_obj.signal_emitter()).await?;
+            StatusNotifierItem::<T>::new_title(&sni_emitter).await?;
+        }
+        #[cfg(feature = "ayatana")]
+        if self.icon_accessible_desc_changed() {
+            sni_changed.insert("IconAccessibleDesc", self.get_icon_accessible_desc().into());
+        }
+        #[cfg(feature = "ayatana")]
+        if self.attention_accessible_desc_changed() {
+            sni_changed.insert(
+                "AttentionAccessibleDesc",
+                self.get_attention_accessible_desc().into(),
+            );
+        }
+        #[cfg(feature = "ayatana")]
+        {
+            let label_changed = self.x_ayatana_label_changed();
+            let guide_changed = self.x_ayatana_label_guide_changed();
+            if label_changed || guide_changed {
+                let label = self.get_x_ayatana_label();
+                let guide = self.get_x_ayatana_label_guide();
+                // `XAyatanaNew*` signals require an
+                // `/org/ayatana/NotificationItem/*` path, so they are filtered
+                // out on snap; emitting them here is only best-effort.
+                // snapd >= 2.78 supports `PropertiesChanged` for this item
+                // path, which is enough for us.
+                // https://github.com/canonical/snapd/blob/0cc7bc56cf8ad82387c98fad5c2b6bd1d063d8ea/interfaces/builtin/unity7.go#L507-L512
+                // https://github.com/canonical/snapd/commit/0cc7bc56cf8ad82387c98fad5c2b6bd1d063d8ea
+                StatusNotifierItem::<T>::x_ayatana_new_label(&sni_emitter, &label, &guide).await?;
+                if label_changed {
+                    sni_changed.insert("XAyatanaLabel", label.into());
+                }
+                if guide_changed {
+                    sni_changed.insert("XAyatanaLabelGuide", guide.into());
+                }
+            }
+        }
+        #[cfg(feature = "ayatana")]
+        if self.x_ayatana_ordering_index_changed() {
+            sni_changed.insert(
+                "XAyatanaOrderingIndex",
+                self.get_x_ayatana_ordering_index().into(),
+            );
         }
         if self.icon_name_changed() || self.icon_pixmap_changed() {
-            StatusNotifierItem::<T>::new_icon(sni_obj.signal_emitter()).await?;
+            StatusNotifierItem::<T>::new_icon(&sni_emitter).await?;
         }
         if self.overlay_icon_name_changed() || self.overlay_icon_pixmap_changed() {
-            StatusNotifierItem::<T>::new_overlay_icon(sni_obj.signal_emitter()).await?;
+            StatusNotifierItem::<T>::new_overlay_icon(&sni_emitter).await?;
         }
         if self.attention_icon_name_changed()
             || self.attention_icon_pixmap_changed()
             || self.attention_movie_name_changed()
         {
-            StatusNotifierItem::<T>::new_attention_icon(sni_obj.signal_emitter()).await?;
+            StatusNotifierItem::<T>::new_attention_icon(&sni_emitter).await?;
         }
         if self.tool_tip_changed() {
-            StatusNotifierItem::<T>::new_tool_tip(sni_obj.signal_emitter()).await?;
+            StatusNotifierItem::<T>::new_tool_tip(&sni_emitter).await?;
         }
 
         if !sni_changed.is_empty() {
             zbus::fdo::Properties::properties_changed(
-                sni_obj.signal_emitter(),
+                &sni_emitter,
                 SNI_INTERFACE,
                 sni_changed,
                 Cow::Borrowed(&[]),
@@ -581,27 +626,35 @@ impl<T: Tray> State<T> {
 }
 
 macro_rules! def_properties_monitor {
-    ($( $name:ident : $type:path ),+) => {
+    ($( $(#[$meta:meta])* $name:ident : $type:path ),+ $(,)?) => {
         struct PropertiesMonitor {
-            $($name: AtomicU64),*
+            $(
+                $(#[$meta])*
+                $name: AtomicU64,
+            )*
         }
 
         impl PropertiesMonitor {
             fn new<T: Tray>(tray: &T) -> Self {
                 Self {
-                    $($name: AtomicU64::new(hash_of(tray.$name()))),*
+                    $(
+                        $(#[$meta])*
+                        $name: AtomicU64::new(hash_of(tray.$name())),
+                    )*
                 }
             }
         }
         impl<T: Tray> State<T> {
             paste! {
                 $(
+                    $(#[$meta])*
                     /// Generated by def_properties_monitor
                     fn [<$name _changed>](&self) -> bool {
                         let new = hash_of(self.tray.$name());
                         let old = self.prop_monitor.$name.swap(new, Ordering::AcqRel);
                         new != old
                     }
+                    $(#[$meta])*
                     /// Should only be called within dbus_interface
                     ///
                     /// Generated by def_properties_monitor
@@ -620,6 +673,16 @@ macro_rules! def_properties_monitor {
 def_properties_monitor! {
     category: crate::Category,
     title: String,
+    #[cfg(feature = "ayatana")]
+    icon_accessible_desc: String,
+    #[cfg(feature = "ayatana")]
+    attention_accessible_desc: String,
+    #[cfg(feature = "ayatana")]
+    x_ayatana_label: String,
+    #[cfg(feature = "ayatana")]
+    x_ayatana_label_guide: String,
+    #[cfg(feature = "ayatana")]
+    x_ayatana_ordering_index: u32,
     status: crate::Status,
     window_id: i32,
     icon_theme_path: String,

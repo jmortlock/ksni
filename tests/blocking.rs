@@ -248,6 +248,8 @@ fn status_notifier_item_protocol() {
         spawn_signal_waiter(&service_name, SNI_PATH, SNI_INTERFACE, "NewAttentionIcon");
     let new_tool_tip = spawn_signal_waiter(&service_name, SNI_PATH, SNI_INTERFACE, "NewToolTip");
     let new_status = spawn_signal_waiter(&service_name, SNI_PATH, SNI_INTERFACE, "NewStatus");
+    let new_icon_theme_path =
+        spawn_signal_waiter(&service_name, SNI_PATH, SNI_INTERFACE, "NewIconThemePath");
     let sni_properties_changed = spawn_filtered_signal_waiter(
         &service_name,
         SNI_PATH,
@@ -274,6 +276,8 @@ fn status_notifier_item_protocol() {
     let _: () = message_body(new_tool_tip.wait(DEFAULT_TIMEOUT));
     let (status,): (String,) = message_body(new_status.wait(DEFAULT_TIMEOUT));
     assert_eq!(status, "NeedsAttention");
+    let (icon_theme_path,): (String,) = message_body(new_icon_theme_path.wait(DEFAULT_TIMEOUT));
+    assert_eq!(icon_theme_path, "/tmp/mock-icons-updated");
 
     let (sni_iface, sni_changed, sni_invalidated): (
         String,
@@ -490,14 +494,22 @@ fn non_standard_compatibility() {
     let item_is_menu: bool = proxy.get_property("ItemIsMenu").unwrap();
     assert!(item_is_menu);
 
-    // non-standard compatibility behavior: ksni reports Activate as UnknownMethod(ItemIsMenu)
-    // when MENU_ON_ACTIVATE is enabled to match existing desktop-environment behavior.
+    // menu-only items must not advertise Activate in introspection, otherwise
+    // GNOME's AppIndicator extension waits a double-click interval on every click.
+    let xml = proxy
+        .introspect()
+        .expect("StatusNotifierItem should be introspectable");
+    assert!(
+        !xml.contains("method name=\"Activate\""),
+        "menu-only items should not expose Activate:\n{xml}"
+    );
+
+    // hosts that call Activate anyway get UnknownMethod
     let activate_err = proxy
         .call::<_, _, ()>("Activate", &(1_i32, 2_i32))
         .expect_err("MENU_ON_ACTIVATE trays should reject Activate calls");
     let activate_err = format!("{activate_err:?}");
     assert!(activate_err.contains("UnknownMethod"));
-    assert!(activate_err.contains("ItemIsMenu"));
 
     // non-standard compatibility behavior: ksni does not implement ContextMenu and reports
     // UnknownMethod instead of trying to render a menu itself.
@@ -506,6 +518,190 @@ fn non_standard_compatibility() {
         .expect_err("ContextMenu should not be implemented");
     let context_err = format!("{context_err:?}");
     assert!(context_err.contains("UnknownMethod"));
+
+    // updates must still emit signals when the menu-only interface is served
+    let new_title = spawn_signal_waiter(&service_name, SNI_PATH, SNI_INTERFACE, "NewTitle");
+    let properties_changed = spawn_filtered_signal_waiter(
+        &service_name,
+        SNI_PATH,
+        PROPERTIES_INTERFACE,
+        "PropertiesChanged",
+        vec![(0, SNI_INTERFACE.to_string())],
+    );
+    handle
+        .update(|tray| {
+            tray.title = "Updated Mock Tray".into();
+            tray.window_id = 42;
+        })
+        .expect("tray should still be alive for updates");
+
+    let _: () = message_body(new_title.wait(DEFAULT_TIMEOUT));
+    let (interface, changed, invalidated): (String, HashMap<String, OwnedVariant>, Vec<String>) =
+        message_body(properties_changed.wait(DEFAULT_TIMEOUT));
+    assert_eq!(interface, SNI_INTERFACE);
+    assert!(invalidated.is_empty());
+    assert!(changed.contains_key("WindowId"));
+
+    // a fresh proxy avoids the blocking proxy's cached properties
+    let connection = session_connection();
+    let proxy = sni_proxy(&connection, &service_name);
+    let title: String = proxy.get_property("Title").unwrap();
+    assert_eq!(title, "Updated Mock Tray");
+    let window_id: i32 = proxy.get_property("WindowId").unwrap();
+    assert_eq!(window_id, 42);
+
+    handle.shutdown().wait();
+    watcher.close();
+}
+
+/// The "ayatana" feature exports the Ayatana extension properties and signal
+/// and keeps them updated, while emitting `XAyatanaNewLabel` only when the
+/// label or its guide changes.
+#[cfg(feature = "ayatana")]
+#[test]
+fn ayatana_protocol() {
+    use ksni::blocking::TrayMethods as _;
+
+    use common::{
+        ayatana_property_assertions, ayatana_updated_property_assertions,
+        mutate_ayatana_properties, sni_properties_changed_map, spawn_sni_properties_changed_waiter,
+        AYATANA_NEW_LABEL_SIGNAL,
+    };
+
+    let watcher = WatcherHandle::start(true).unwrap();
+    let (tray, _) = TestTray::<false>::new("runtime-protocol-tray");
+    let handle = tray.spawn().expect("tray should start");
+    let service_name = watcher.wait_for_item_registration(DEFAULT_TIMEOUT);
+    let connection = session_connection();
+
+    // The extension members are exported and expose the trait defaults.
+    ayatana_property_assertions(&connection, &service_name);
+
+    // Changing everything at once: one NewLabel signal carrying both values
+    // and one PropertiesChanged containing all five properties.
+    let new_label = spawn_signal_waiter(
+        &service_name,
+        SNI_PATH,
+        SNI_INTERFACE,
+        AYATANA_NEW_LABEL_SIGNAL,
+    );
+    let properties_changed = spawn_sni_properties_changed_waiter(&service_name);
+
+    handle
+        .update(mutate_ayatana_properties)
+        .expect("tray should still be alive for updates");
+
+    let (label, guide): (String, String) = message_body(new_label.wait(DEFAULT_TIMEOUT));
+    assert_eq!(label, "42%");
+    assert_eq!(guide, "100%");
+    assert_eq!(
+        sni_properties_changed_map(properties_changed),
+        properties! {
+            "IconAccessibleDesc" => "Main icon description",
+            "AttentionAccessibleDesc" => "Attention icon description",
+            "XAyatanaLabel" => "42%",
+            "XAyatanaLabelGuide" => "100%",
+            "XAyatanaOrderingIndex" => 7_u32,
+        }
+    );
+    ayatana_updated_property_assertions(&connection, &service_name);
+
+    // Changing only the label: the signal still carries the current guide and
+    // PropertiesChanged contains only the changed property.
+    let new_label = spawn_signal_waiter(
+        &service_name,
+        SNI_PATH,
+        SNI_INTERFACE,
+        AYATANA_NEW_LABEL_SIGNAL,
+    );
+    let properties_changed = spawn_sni_properties_changed_waiter(&service_name);
+
+    handle
+        .update(|tray| tray.x_ayatana_label = "43%".into())
+        .expect("tray should still be alive for updates");
+
+    let (label, guide): (String, String) = message_body(new_label.wait(DEFAULT_TIMEOUT));
+    assert_eq!(label, "43%");
+    assert_eq!(guide, "100%");
+    assert_eq!(
+        sni_properties_changed_map(properties_changed),
+        properties! { "XAyatanaLabel" => "43%" }
+    );
+
+    // Changing only the guide: same signal, still carrying the current label.
+    let new_label = spawn_signal_waiter(
+        &service_name,
+        SNI_PATH,
+        SNI_INTERFACE,
+        AYATANA_NEW_LABEL_SIGNAL,
+    );
+    let properties_changed = spawn_sni_properties_changed_waiter(&service_name);
+
+    handle
+        .update(|tray| tray.x_ayatana_label_guide = "999%".into())
+        .expect("tray should still be alive for updates");
+
+    let (label, guide): (String, String) = message_body(new_label.wait(DEFAULT_TIMEOUT));
+    assert_eq!(label, "43%");
+    assert_eq!(guide, "999%");
+    assert_eq!(
+        sni_properties_changed_map(properties_changed),
+        properties! { "XAyatanaLabelGuide" => "999%" }
+    );
+
+    // Changing only the other extension properties must not emit
+    // XAyatanaNewLabel.
+    let new_label = spawn_signal_waiter(
+        &service_name,
+        SNI_PATH,
+        SNI_INTERFACE,
+        AYATANA_NEW_LABEL_SIGNAL,
+    );
+    let properties_changed = spawn_sni_properties_changed_waiter(&service_name);
+
+    handle
+        .update(|tray| {
+            tray.icon_accessible_desc = "Updated icon description".into();
+            tray.attention_accessible_desc = "Updated attention description".into();
+            tray.x_ayatana_ordering_index = 9;
+        })
+        .expect("tray should still be alive for updates");
+
+    new_label.expect_no_signal(DEFAULT_TIMEOUT);
+    assert_eq!(
+        sni_properties_changed_map(properties_changed),
+        properties! {
+            "IconAccessibleDesc" => "Updated icon description",
+            "AttentionAccessibleDesc" => "Updated attention description",
+            "XAyatanaOrderingIndex" => 9_u32,
+        }
+    );
+    let proxy = sni_proxy(&connection, &service_name);
+    assert_eq!(
+        proxy.get_property::<u32>("XAyatanaOrderingIndex").unwrap(),
+        9
+    );
+
+    handle.shutdown().wait();
+    watcher.close();
+}
+
+/// Without the "ayatana" feature, the extension members must not be part of
+/// the `org.kde.StatusNotifierItem` interface.
+#[cfg(not(feature = "ayatana"))]
+#[test]
+fn ayatana_absent() {
+    use ksni::blocking::TrayMethods as _;
+
+    use common::ayatana_absent_assertions;
+
+    let watcher = WatcherHandle::start(true).unwrap();
+    let (tray, _) = TestTray::<false>::new("runtime-protocol-tray");
+    let handle = tray.spawn().expect("tray should start");
+    let service_name = watcher.wait_for_item_registration(DEFAULT_TIMEOUT);
+    let connection = session_connection();
+
+    ayatana_absent_assertions(&connection, &service_name);
 
     handle.shutdown().wait();
     watcher.close();
